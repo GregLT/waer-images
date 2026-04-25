@@ -2,25 +2,64 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { createServerClient } from "@/lib/supabase/server";
 import { generatePrompt } from "@/lib/prompt";
-import type { GenerateRequest, ProductState, AspectRatio, GenerationMode } from "@/types";
+import { generateScenePrompt } from "@/lib/scene-prompt";
+import { compositeProductOnScene, resolveProductPngUrl } from "@/lib/composite";
+import type { GenerateRequest, ProductState, AspectRatio } from "@/types";
 
-const ASPECT_RATIO_TO_SIZE: Record<string, "1024x1024" | "1024x1536" | "1536x1024"> = {
+const SIZE_MAP: Record<AspectRatio, "1024x1024" | "1024x1536" | "1536x1024"> = {
   "1:1": "1024x1024",
   "4:5": "1024x1024",
   "9:16": "1024x1536",
 };
 
+// Extract raw image buffer from an OpenAI image object
+async function getImageBuffer(img: {
+  url?: string | null;
+  b64_json?: string | null;
+}): Promise<Buffer> {
+  if (img.b64_json) return Buffer.from(img.b64_json, "base64");
+  if (img.url) {
+    const res = await fetch(img.url);
+    if (!res.ok) throw new Error(`Failed to fetch generated image (${res.status})`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+  throw new Error("No image data in OpenAI response");
+}
+
+// Upload a buffer to Supabase Storage and return public URL
+async function uploadBuffer(
+  supabase: ReturnType<typeof createServerClient>,
+  buffer: Buffer,
+  scentId: string,
+  index: number
+): Promise<string> {
+  const fileName = `${scentId}/${Date.now()}-${index}.png`;
+  const { error } = await supabase.storage
+    .from("generated-assets")
+    .upload(fileName, buffer, { contentType: "image/png", upsert: false });
+  if (error) throw new Error(`Storage upload failed: ${error.message}`);
+  const { data } = supabase.storage.from("generated-assets").getPublicUrl(fileName);
+  return data.publicUrl;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body: GenerateRequest = await req.json();
-    const { scentId, productState, aspectRatio, generationMode, referenceImageUrl, isOnBrandBoost } = body;
+    const {
+      scentId,
+      productState,
+      aspectRatio,
+      generationMode,
+      referenceImageUrl,
+      isOnBrandBoost = false,
+      addShadow = true,
+    } = body;
 
     if (!scentId || !productState || !aspectRatio || !generationMode) {
       return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
     }
 
     const supabase = createServerClient();
-
     const { data: scent, error: scentError } = await supabase
       .from("scents")
       .select("*")
@@ -31,78 +70,146 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Scent not found" }, { status: 404 });
     }
 
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const size = SIZE_MAP[aspectRatio as AspectRatio] ?? "1024x1024";
+
+    // ── Mode: scene_plus_locked_product ──────────────────────────────────────
+    if (generationMode === "scene_plus_locked_product") {
+      const productPngUrl = resolveProductPngUrl(scent, productState);
+      if (!productPngUrl) {
+        return NextResponse.json(
+          {
+            error: `No locked product PNG found for state "${productState}". Upload a product PNG in the scent settings first.`,
+          },
+          { status: 400 }
+        );
+      }
+
+      const scenePrompt = generateScenePrompt({
+        scent,
+        productState: productState as ProductState,
+        aspectRatio: aspectRatio as AspectRatio,
+        isOnBrandBoost,
+      });
+
+      const result = await openai.images.generate({
+        model: "gpt-image-1",
+        prompt: scenePrompt,
+        size,
+        n: 4,
+      });
+
+      const savedAssets = await Promise.all(
+        (result.data ?? []).map(async (img, index) => {
+          const sceneBuffer = await getImageBuffer(img);
+
+          const composited = await compositeProductOnScene({
+            sceneBuffer,
+            productPngUrl,
+            aspectRatio: aspectRatio as AspectRatio,
+            addShadow,
+          });
+
+          const imageUrl = await uploadBuffer(supabase, composited, scentId, index);
+
+          const { data: asset, error: dbError } = await supabase
+            .from("assets")
+            .insert({
+              scent_id: scentId,
+              product_state: productState,
+              prompt: scenePrompt,
+              scene_prompt: scenePrompt,
+              product_png_url: productPngUrl,
+              image_url: imageUrl,
+              aspect_ratio: aspectRatio,
+              generation_mode: generationMode,
+            })
+            .select()
+            .single();
+
+          if (dbError) throw new Error(`DB insert failed: ${dbError.message}`);
+          return asset;
+        })
+      );
+
+      return NextResponse.json({ assets: savedAssets, prompt: scenePrompt });
+    }
+
+    // ── Mode: reference_edit ─────────────────────────────────────────────────
+    if (generationMode === "reference_edit") {
+      if (!referenceImageUrl) {
+        return NextResponse.json(
+          { error: "referenceImageUrl is required for reference_edit mode" },
+          { status: 400 }
+        );
+      }
+
+      const prompt = generatePrompt({
+        scent,
+        productState: productState as ProductState,
+        aspectRatio: aspectRatio as AspectRatio,
+        isOnBrandBoost,
+      });
+
+      const refRes = await fetch(referenceImageUrl);
+      if (!refRes.ok) throw new Error(`Failed to fetch reference image (${refRes.status})`);
+      const refBlob = await refRes.blob();
+      const refFile = new File([refBlob], "reference.png", { type: refBlob.type });
+
+      const result = await openai.images.generate({
+        model: "gpt-image-1",
+        prompt,
+        // @ts-expect-error – image param is valid for gpt-image-1
+        image: [refFile],
+        size,
+        n: 4,
+      });
+
+      const savedAssets = await Promise.all(
+        (result.data ?? []).map(async (img, index) => {
+          const buffer = await getImageBuffer(img);
+          const imageUrl = await uploadBuffer(supabase, buffer, scentId, index);
+
+          const { data: asset, error: dbError } = await supabase
+            .from("assets")
+            .insert({
+              scent_id: scentId,
+              product_state: productState,
+              prompt,
+              image_url: imageUrl,
+              aspect_ratio: aspectRatio,
+              generation_mode: generationMode,
+            })
+            .select()
+            .single();
+
+          if (dbError) throw new Error(`DB insert failed: ${dbError.message}`);
+          return asset;
+        })
+      );
+
+      return NextResponse.json({ assets: savedAssets, prompt });
+    }
+
+    // ── Mode: ai_full_generation ─────────────────────────────────────────────
     const prompt = generatePrompt({
       scent,
       productState: productState as ProductState,
       aspectRatio: aspectRatio as AspectRatio,
-      isOnBrandBoost: isOnBrandBoost ?? false,
+      isOnBrandBoost,
     });
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const size = ASPECT_RATIO_TO_SIZE[aspectRatio] ?? "1024x1024";
-
-    let result;
-
-    if (generationMode === "reference" && referenceImageUrl) {
-      const imageResponse = await fetch(referenceImageUrl);
-      const imageBlob = await imageResponse.blob();
-      const imageFile = new File([imageBlob], "reference.png", { type: imageBlob.type });
-
-      result = await openai.images.generate({
-        model: "gpt-image-1",
-        prompt,
-        // @ts-expect-error – image param is valid for gpt-image-1
-        image: [imageFile],
-        size,
-        n: 4,
-      });
-    } else {
-      result = await openai.images.generate({
-        model: "gpt-image-1",
-        prompt,
-        size,
-        n: 4,
-      });
-    }
+    const result = await openai.images.generate({
+      model: "gpt-image-1",
+      prompt,
+      size,
+      n: 4,
+    });
 
     const savedAssets = await Promise.all(
       (result.data ?? []).map(async (img, index) => {
-        let storageUrl: string;
-
-        if (img.url) {
-          const imgResponse = await fetch(img.url);
-          const imgBlob = await imgResponse.blob();
-          const fileName = `${scentId}/${Date.now()}-${index}.png`;
-
-          const { error: uploadError } = await supabase.storage
-            .from("generated-assets")
-            .upload(fileName, imgBlob, { contentType: "image/png", upsert: false });
-
-          if (uploadError) throw new Error(`Storage upload failed: ${uploadError.message}`);
-
-          const { data: publicData } = supabase.storage
-            .from("generated-assets")
-            .getPublicUrl(fileName);
-
-          storageUrl = publicData.publicUrl;
-        } else if (img.b64_json) {
-          const binary = Buffer.from(img.b64_json, "base64");
-          const fileName = `${scentId}/${Date.now()}-${index}.png`;
-
-          const { error: uploadError } = await supabase.storage
-            .from("generated-assets")
-            .upload(fileName, binary, { contentType: "image/png", upsert: false });
-
-          if (uploadError) throw new Error(`Storage upload failed: ${uploadError.message}`);
-
-          const { data: publicData } = supabase.storage
-            .from("generated-assets")
-            .getPublicUrl(fileName);
-
-          storageUrl = publicData.publicUrl;
-        } else {
-          throw new Error("No image data in OpenAI response");
-        }
+        const buffer = await getImageBuffer(img);
+        const imageUrl = await uploadBuffer(supabase, buffer, scentId, index);
 
         const { data: asset, error: dbError } = await supabase
           .from("assets")
@@ -110,9 +217,9 @@ export async function POST(req: NextRequest) {
             scent_id: scentId,
             product_state: productState,
             prompt,
-            image_url: storageUrl,
+            image_url: imageUrl,
             aspect_ratio: aspectRatio,
-            generation_mode: generationMode as GenerationMode,
+            generation_mode: generationMode,
           })
           .select()
           .single();
